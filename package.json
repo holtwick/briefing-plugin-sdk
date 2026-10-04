@@ -1,0 +1,67 @@
+{
+  "name": "briefing-plugin-sdk",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Build plugins for Briefing, the secure video chat: plugin API, Vite preset and test helpers",
+  "author": {
+    "name": "Dirk Holtwick",
+    "url": "https://holtwick.de"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/holtwick/briefing-plugin-sdk#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/holtwick/briefing-plugin-sdk.git"
+  },
+  "keywords": [
+    "briefing",
+    "plugin",
+    "sdk",
+    "webrtc",
+    "video-chat",
+    "vue"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "import": "./dist/vite.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "vite": "^8.1.0",
+    "vue": "^3.5.0",
+    "vue-router": "^5.0.0",
+    "yjs": "^13.6.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    },
+    "vue-router": {
+      "optional": true
+    },
+    "yjs": {
+      "optional": true
+    }
+  }
+}

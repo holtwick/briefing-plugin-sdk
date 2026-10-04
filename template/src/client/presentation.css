@@ -1,0 +1,37 @@
+/*
+ * Plain CSS: the build puts it into dist/plugin.css, Briefing links it.
+ * Prefix every class with something unique to the plugin. The `var(...)`
+ * values follow Briefing's theme (light and dark), the fallbacks apply
+ * when the plugin runs standalone.
+ */
+.my-plugin {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 1rem;
+  height: 100%;
+  padding: 1rem;
+  box-sizing: border-box;
+  color: var(--fg, #222);
+  text-align: center;
+}
+
+.my-plugin p {
+  margin: 0;
+}
+
+.my-plugin-count {
+  font-size: 4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.my-plugin-button {
+  font: inherit;
+  padding: 0.5rem 1.25rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}

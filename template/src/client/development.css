@@ -1,0 +1,20 @@
+html,
+body {
+  height: 100%;
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #eee;
+}
+
+#app {
+  position: absolute;
+  inset: 32px;
+  display: flex;
+}
+
+.dev-stage {
+  flex: 1;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+}

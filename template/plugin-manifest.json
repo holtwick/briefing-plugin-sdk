@@ -1,0 +1,7 @@
+{
+  "$schema": "https://about.brie.fi/plugin-manifest.schema.json#",
+  "id": "com.example.my-plugin",
+  "name": "My plugin",
+  "version": "0.1.0",
+  "description": "A plugin for Briefing."
+}

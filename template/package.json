@@ -1,0 +1,22 @@
+{
+  "name": "com.example.my-plugin",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "type-check": "vue-tsc --noEmit",
+    "check": "vue-tsc --noEmit && vitest run && vite build"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.9",
+    "briefing-plugin-sdk": "^0.1.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3",
+    "vue": "^3.5.43",
+    "vue-tsc": "3.3.11"
+  }
+}
