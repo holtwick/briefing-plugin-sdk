@@ -11,6 +11,7 @@
     "check": "vue-tsc --noEmit && vitest run && vite build"
   },
   "devDependencies": {
+    "@types/node": "^26.6.4",
     "@vitejs/plugin-vue": "^6.0.9",
     "briefing-plugin-sdk": "^0.1.0",
     "typescript": "^6.0.3",
