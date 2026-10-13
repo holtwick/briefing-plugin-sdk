@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AppGlobalContext } from 'briefing-plugin-sdk'
 import { documentSyncId } from 'briefing-plugin-sdk'
-import { inject, reactive } from 'vue'
+import { computed, inject, reactive } from 'vue'
 import { pluginName } from '@/_types'
 
 import './presentation.css'
@@ -23,8 +23,14 @@ const counter = app?.state.sync?.getMO(documentSyncId(pluginName, props.docId), 
 
 const step = app?.config[pluginName]?.step ?? 1
 
+// In a moderated room only moderators and presenters change stage
+// documents; everybody else sees them read-only. Missing (older hosts, no
+// moderation) means allowed.
+const canEdit = computed(() => app?.state.moderation?.canEdit ?? true)
+
 function doIncrement() {
-  counter.count += step
+  if (canEdit.value)
+    counter.count += step
 }
 </script>
 
@@ -34,7 +40,7 @@ function doIncrement() {
     <div class="my-plugin-count">
       {{ counter.count }}
     </div>
-    <button type="button" class="my-plugin-button" @click="doIncrement">
+    <button v-if="canEdit" type="button" class="my-plugin-button" @click="doIncrement">
       {{ t('increment') }}
     </button>
   </div>

@@ -1,4 +1,4 @@
-import { App, Component, Raw, Ref } from "vue";
+import { App, Component, PropType, Raw, Ref } from "vue";
 import { Router } from "vue-router";
 import * as Y from "yjs";
 type LogLevel = number;
@@ -651,7 +651,52 @@ interface SendParameters {
   maxBitrate?: number;
   /** Video only */
   maxFramerate?: number;
+  /**
+   * Video only: codecs to prefer, as mime types, best first (e.g.
+   * `video/AV1`). Others stay possible behind them, so every receiver still
+   * finds one it can decode. Set by the stream's owner (`setSendDefaults`),
+   * not by receivers.
+   */
+  codecs?: string[];
 }
+/**
+ * What the browser reports about one RTP stream of a track, for diagnostics.
+ * Counters only: rates come from two readings (`bytes`, `timestamp`).
+ */
+interface TrackStats {
+  /** Stats id, the same RTP stream reads the same over several peers (LiveKit) */
+  id: string;
+  direction: 'in' | 'out';
+  /** Mime type, e.g. `video/AV1` */
+  codec?: string;
+  width?: number;
+  height?: number;
+  framesPerSecond?: number;
+  /** Sent or received so far */
+  bytes: number;
+  /** Milliseconds */
+  timestamp: number;
+  /** Encoder or decoder the browser picked, e.g. `libaom`, `VideoToolbox` (Chromium only) */
+  implementation?: string;
+  /** Hardware encoder or decoder (Chromium only) */
+  powerEfficient?: boolean;
+  /** Why the encoder sends less than asked: `bandwidth`, `cpu`, `none`, ... */
+  qualityLimitationReason?: string;
+  /** SVC layers, e.g. `L1T3` */
+  scalabilityMode?: string;
+  /** Simulcast layer */
+  rid?: string;
+  /** Path of the connection carrying it, see `ConnectionRoute` */
+  route?: ConnectionRoute;
+  /** Through a media server (LiveKit): `route` is the way to the server, not to the peer */
+  sfu?: boolean;
+}
+/**
+ * The path a direct connection takes: `local` both ends on the same network,
+ * `direct` straight between the two (through NAT, found via STUN), `relay`
+ * through a TURN server (on at least one end).
+ */
+type ConnectionRoute = 'local' | 'direct' | 'relay';
 /** Events of a `RoomVisitor` */
 interface RoomVisitorEvents {
   peerReady: () => void;
@@ -703,6 +748,18 @@ interface RoomVisitor extends Emitter<RoomVisitorEvents> {
    * connected, or for transports without a direct connection (LiveKit).
    */
   getSafetyCode?: () => Promise<string[] | undefined>;
+  /**
+   * How the direct connection to this peer runs right now. `undefined`
+   * while not connected or when the browser reports no candidates, absent
+   * for transports without a direct connection (LiveKit).
+   */
+  getConnectionRoute?: () => Promise<ConnectionRoute | undefined>;
+  /**
+   * Diagnostics of the RTP streams carrying `track` to or from this peer:
+   * a received track of theirs, or a local track we send them. `undefined`
+   * while not connected or when the transport cannot tell.
+   */
+  getTrackStats?: (track: MediaStreamTrack) => Promise<TrackStats[] | undefined>;
 }
 /** Admission state of the local participant */
 type RoomState = 'admin' | 'pending' | 'rejected' | 'accepted' | 'error';
@@ -765,12 +822,85 @@ interface Room extends Emitter<RoomEvents> {
   join: () => void;
   /** Call `fn` for every connected remote peer */
   forEachVisitor: (fn: (visitor: RoomVisitor) => void) => void;
+  /**
+   * Bytes sent and received so far over all media connections of this room
+   * (counters only grow; rates come from two calls). Optional: transports
+   * without it show no traffic.
+   */
+  getTraffic?: () => Promise<RoomTraffic>;
+  /**
+   * Drop a peer and refuse it for the rest of this room session: its
+   * connection is closed, its join verifications fail, its key exchange
+   * messages are ignored. Peer ids are chosen by the clients, so this only
+   * holds against the same id - a new secret (`rotateSecret`) is what keeps
+   * the person out. Optional: used by the `moderation` plugin.
+   */
+  denyPeer?: (peerId: string) => void | Promise<void>;
+  /**
+   * Move the whole call to a new secret without hanging up: the room key
+   * and the server's room id change, existing direct connections stay.
+   * Peers not in `keep` are dropped. Resolves `false` where the transport
+   * cannot do it (it then changes nothing). Optional: mesh only for now.
+   */
+  rotateSecret?: (secret: string, keep?: string[]) => Promise<boolean>;
+  /**
+   * Stop (`true`) or resume receiving the sound of a peer, to save bandwidth
+   * while it is not played anyway (muted by a moderator, a viewer). Optional:
+   * where the transport cannot (mesh), the sound still arrives and the
+   * receivers simply do not play it. Used by the `moderation` plugin.
+   */
+  ignoreAudioOf?: (peerId: string, ignore: boolean) => void;
   dispose: UseDispose;
+}
+interface RoomTraffic {
+  bytesSent: number;
+  bytesReceived: number;
 }
 interface RoomManager {
   roomUrl: () => string | undefined;
   roomEnter: (name: string, secret?: string, options?: RoomEnterOptions) => Promise<void>;
   roomLeave: () => Promise<void>;
+}
+/** Events of a `PeerDataChannel` */
+interface PeerDataChannelEvents {
+  /** The channel to this visitor is open, frames can be sent */
+  dataVisitorEnters: (visitor: RoomVisitor) => void;
+  /** The channel to this visitor closed (visitor left or channel dropped) */
+  dataVisitorLeaves: (visitor: RoomVisitor) => void;
+  /** A decrypted frame, delivered in order and one at a time per visitor */
+  dataFrame: (visitor: RoomVisitor, frame: Uint8Array) => void | Promise<void>;
+}
+/**
+ * An end-to-end encrypted data channel to every participant of the room,
+ * carrying frames: small binary messages (below 64 KB) whose format belongs
+ * to the plugin. Sending waits while a peer's buffer is full, frames arrive
+ * in order. Open it with `state.openDataChannel(room, { name })`.
+ */
+interface PeerDataChannel {
+  emitter: Emitter<PeerDataChannelEvents>;
+  /** Sends one frame; `false` if there is no open channel to the visitor (the frame is dropped) */
+  send: (visitor: RoomVisitor, frame: Uint8Array) => Promise<boolean>;
+  /** Sends one frame to every visitor with an open channel */
+  sendAll: (frame: Uint8Array) => Promise<void>;
+  /** Visitors with an open channel */
+  visitors: () => RoomVisitor[];
+  /** The peer broke the protocol: drop the channel to it */
+  closeVisitor: (visitor: RoomVisitor, reason: string, err?: unknown) => void;
+  dispose: UseDisposeWithUtils;
+}
+/** Opens a `PeerDataChannel` in `room`; `name` (the plugin name) keeps channels of plugins apart */
+type OpenPeerDataChannel = (room: Room, opt: {
+  name: string;
+}) => PeerDataChannel;
+declare global {
+  interface AppState {
+    /**
+     * Opens an encrypted data channel to every peer of a room, see
+     * `PeerDataChannel`. Provided by the app; dispose the channel when the
+     * room is left.
+     */
+    openDataChannel?: OpenPeerDataChannel;
+  }
 }
 /**
  * How large a remote video is rendered on this device. A renderer reports
@@ -843,7 +973,7 @@ declare global {
     appStopMediaStream: (name: string) => void;
     /**
      * A remote video is shown (or no longer shown) on this device. Renderers
-     * like stage-pro report every tile, the `video-adapt` plugin turns that
+     * like `stage` report every tile, the `video-adapt` plugin turns that
      * into per-peer send hints. Nobody listening is fine: then every peer
      * keeps sending at full quality.
      */
@@ -859,6 +989,24 @@ interface MediaStartOptions {
   audio?: boolean;
   video?: boolean;
 }
+/** A processed copy of the camera, see `VideoProcessor` */
+interface ProcessedVideoTrack {
+  /** Sent instead of the camera's track */
+  track: MediaStreamTrack;
+  /** Stops `track` and frees everything behind it; the camera's track stays */
+  dispose: () => void;
+}
+/**
+ * Turns the camera's track into the track that is sent (background effects,
+ * filters). Called for every new camera track and whenever the processor is
+ * set again. Resolve `undefined` to send the camera as it is (not possible
+ * here, not ready yet - set the processor again once it is). Call
+ * `fail()` when a running copy breaks: the camera's track is sent again
+ * until the processor is set anew. Mute and unmute reach the copy too.
+ */
+type VideoProcessor = (camera: MediaStreamTrack, context: {
+  fail: () => void;
+}) => Promise<ProcessedVideoTrack | undefined>;
 /** Controls the local camera and microphone (`state.media.manager`) */
 interface MediaManager {
   /** Acquire what is asked for (default both); tracks already running are kept. */
@@ -878,7 +1026,18 @@ interface MediaManager {
    * whether it was granted.
    */
   requestDeviceAccess?: (kind: 'audio' | 'video') => Promise<boolean>;
+  /**
+   * Process the camera before it is sent, see `VideoProcessor`; `undefined`
+   * removes it. One processor at a time, the last one set wins. Setting the
+   * same function again applies it anew (e.g. after its options changed).
+   */
+  setVideoProcessor?: (processor?: VideoProcessor) => Promise<void>;
 }
+/**
+ * Where a camera points: `user` at the person (front camera, webcam),
+ * `environment` away from them (rear camera, macOS Desk View).
+ */
+type CameraFacing = 'user' | 'environment';
 /** A camera or microphone, see `MediaState.devices` */
 interface MediaManagerDeviceInfo {
   readonly deviceId: string;
@@ -888,16 +1047,103 @@ interface MediaManagerDeviceInfo {
   readonly label: string;
   readonly active: boolean;
   readonly muted: boolean;
+  /** Cameras only, when the browser or the label tells */
+  readonly facing?: CameraFacing;
 }
 /** Reactive state of the local camera and microphone (`state.media`) */
 interface MediaState {
+  /** The user's wish to see the own camera mirrored; applies only to a camera not facing `environment` */
   readonly videoFlip: boolean;
+  /** Where the running camera points, `undefined` if unknown */
+  readonly videoFacing?: CameraFacing;
   readonly videoMute: boolean;
   readonly audioMute: boolean;
   readonly devices: MediaManagerDeviceInfo[];
   readonly stream?: Raw<MediaStream>;
   readonly manager?: Raw<MediaManager>;
   readonly access?: 'ok' | 'not-allowed' | 'not-available' | 'error';
+}
+/**
+ * Roles in a moderated room (plugin `moderation`). `moderator`: holds the
+ * room's moderator key; `presenter`: may share (screens, stage documents),
+ * manage and edit stage documents and drive presentations (slides);
+ * `participant`: the default - camera, microphone, chat, raise hand,
+ * reactions and the laser pointer, but no sharing and stage documents
+ * read-only; `viewer`: watches and listens, sends neither camera,
+ * microphone nor screen, no laser pointer.
+ */
+type ModerationRole = 'moderator' | 'presenter' | 'participant' | 'viewer';
+/**
+ * Roles of the current room, set while the plugin `moderation` is active. A
+ * role is a grant signed with the moderator key that every client checks
+ * itself - the server never sees roles and cannot forge them. In an
+ * unmoderated room `moderated` is `false` and everybody is a `participant`.
+ */
+interface ModerationApi {
+  /** The room link binds a moderator key, or the room is moderated for the running session (`session`) */
+  readonly moderated: boolean;
+  /** Moderated for the running session only, by a key somebody made while alone in the room; it ends when the room is empty */
+  readonly session?: boolean;
+  /** This participant holds the moderator key */
+  readonly isModerator: boolean;
+  /** Own role, `participant` in an unmoderated room */
+  readonly role: ModerationRole;
+  /** Role of a peer, by a verified grant; `participant` without one */
+  roleOf: (peerId?: string) => ModerationRole;
+  /** Whether a peer may drive presentations: moderators and presenters in a moderated room, everybody otherwise */
+  mayPresent: (peerId?: string) => boolean;
+  /**
+   * Whether a peer may share: screens and stage documents (whiteboard,
+   * editors, watch together, slides, ...). Moderators and presenters in a
+   * moderated room, everybody otherwise. Receivers hide screens and
+   * documents of a peer that may not share.
+   */
+  mayShare: (peerId?: string) => boolean;
+  /**
+   * Whether a peer may manage and edit stage documents: close them, change
+   * a synced stage layout, change their content (whiteboard, editors,
+   * playback of a video watched together, ...). The same set as `mayShare`:
+   * moderators and presenters in a moderated room, everybody otherwise.
+   * Receivers ignore what they can attribute to a peer without it (e.g. a
+   * document closed by it); content without an authenticated author is
+   * protected by the UI only.
+   */
+  mayEdit: (peerId?: string) => boolean;
+  /**
+   * Whether this participant may manage and edit stage documents
+   * (`mayEdit` of the own peer id). A document plugin asks this one thing
+   * and shows its content read-only while it is `false`. Plugins for older
+   * hosts read it as `app.state.moderation?.canEdit ?? true`: missing means
+   * allowed.
+   */
+  readonly canEdit: boolean;
+  /** Whether a peer may use the laser pointer: everybody but viewers in a moderated room, everybody otherwise. Receivers ignore pointer frames of a peer without it. */
+  mayPoint: (peerId?: string) => boolean;
+  /** Whether the media of a peer is to be ignored (a viewer in a moderated room) */
+  ignoresMediaOf: (peerId?: string) => boolean;
+  /**
+   * Whether a moderator muted a peer. Receivers do not play its sound;
+   * its own client keeps the microphone off. Moderators are never muted.
+   */
+  isMuted?: (peerId?: string) => boolean;
+  /**
+   * Whether the sound of a peer is not to be played: a viewer
+   * (`ignoresMediaOf`) or muted by a moderator (`isMuted`). Every plugin
+   * that plays sound of other participants checks this.
+   */
+  ignoresAudioOf?: (peerId?: string) => boolean;
+  /**
+   * A moderator muted this participant: the microphone stays off and may not
+   * be switched on (button, shortcut, push-to-talk) until a moderator lifts
+   * it. Lifting never switches the microphone on.
+   */
+  readonly micLocked?: boolean;
+}
+declare global {
+  interface AppState {
+    /** Roles of moderated rooms, set while the plugin `moderation` is active */
+    moderation?: ModerationApi;
+  }
 }
 /**
  * Base class of every plugin. A host (Briefing, ...) narrows `Context` to the
@@ -918,6 +1164,12 @@ declare abstract class PluginBase<Context = unknown> {
   abstract name: string;
   /** Names of plugins this plugin depends on */
   requires?: string[];
+  /**
+   * Names of plugins this plugin must not run together with, e.g. two
+   * providers of the same thing. Declaring it on one side is enough, hosts
+   * read it in both directions.
+   */
+  conflicts?: string[];
   /** Schema of the configuration this plugin accepts, validated before `setup()` */
   configSchema?: Type<object>;
   /** Called once after all plugins are registered and configured */
@@ -982,9 +1234,127 @@ interface AppPluginBaseContext<Config = AppConfig> extends AppBaseContext<Config
 }
 /**
  * Base class of every Briefing plugin, see `PluginBase` for the members
- * (`name`, `requires`, `configSchema`, `setup`, `sortWeight`).
+ * (`name`, `requires`, `conflicts`, `configSchema`, `setup`, `sortWeight`).
  */
 declare abstract class AppPluginBase<Context = AppBaseContext> extends PluginBase<Context> {}
+/**
+ * Keyboard shortcuts, registered with `ctx.addShortcuts()` and dispatched by
+ * the `shortcuts` plugin: one listener for the whole app, with the common
+ * guards (text fields, open dialogs, IME composition), hold keys, conflict
+ * detection, the `?` overview and optional own bindings per user.
+ */
+/** Pressed and released: push-to-talk, hold-for-laser */
+interface AppShortcutHold {
+  /** Key went down (once, auto-repeat is swallowed) */
+  down: (event: KeyboardEvent) => void;
+  /** Key went up - or the window lost focus or was hidden while it was down */
+  up: () => void;
+}
+/**
+ * One shortcut. Give either `action` or `hold`.
+ *
+ * Bindings (`keys`) are written in this notation:
+ * `M`, `Shift+M`, `Mod+Shift+M` (`Mod` = ⌘ on Apple, Ctrl
+ * elsewhere), `Alt+K`, `Space`, `Escape`, `ArrowRight`, `PageDown`, `?`.
+ * A binding without Mod/Ctrl/Alt whose key is a character (letter, digit,
+ * symbol, Space) is a "single key": the operator may turn all of those off
+ * (`shortcuts.singleKeys`), so important actions should have a chord too.
+ */
+interface AppShortcut {
+  /** Stable id `<plugin>.<name>`, also the key of a user's own binding - never rename */
+  id: string;
+  /** What it does, as i18n key (shown in the overview) */
+  title: string;
+  /** Heading it is listed under, as i18n key; default `<plugin>.title` */
+  group?: string;
+  /** Default bindings, the first one is the main one */
+  keys: string | string[];
+  /** Runs on key down; auto-repeat only with `repeat` */
+  action?: (event: KeyboardEvent) => void;
+  /** Runs while the key is held instead of `action` */
+  hold?: AppShortcutHold;
+  /**
+   * The shortcut applies right now, e.g. "in a room" or "my presentation is
+   * shown". Called with the event when a key matches (return `false` to let
+   * the key through untouched) and without one for listings.
+   */
+  when?: (event?: KeyboardEvent) => boolean;
+  /** Also fires inside text fields (input, textarea, select, contenteditable) - only for chords */
+  allowInEditable?: boolean;
+  /** Space/Enter also fire while a button, link or other control has the focus (they would activate it) */
+  allowOnControls?: boolean;
+  /** Holding the key repeats `action` (paging, stepping); default: once per press */
+  repeat?: boolean;
+  /**
+   * Of several shortcuts on the same key, the one with the highest priority
+   * whose `when` allows it runs; default 0. Use a higher one for shortcuts that
+   * apply only in a narrow situation (a presentation, a focused document), so
+   * they win over the general meaning of the key.
+   */
+  priority?: number;
+}
+/** A registered shortcut, as kept in `AppGlobalContext.shortcuts` */
+interface AppShortcutEntry extends AppShortcut {
+  /** The keys, always as list */
+  keys: string[];
+  /** Name of the plugin that added it */
+  pluginName: string;
+}
+/**
+ * Files a stage document type shows (`AppComponent.files`, placement
+ * `presentation`). A file dropped on the room window, picked with "Open
+ * file" in the stage menu or sent to the stage from the chat opens a new
+ * document of a type that takes it; when several do, the participant
+ * chooses. A file matches by extension or by MIME type.
+ */
+interface AppDocumentFiles {
+  /** File name extensions, lower case and without the dot, e.g. `['gpx']` */
+  extensions?: string[];
+  /** MIME types, `video/*` for a whole group. Received files may carry no or a generic type: list the extensions too */
+  types?: string[];
+  /** Bytes; a larger file is not offered to this document type */
+  maxSize?: number;
+  /**
+   * What opening the file does, as i18n key, shown when several document
+   * types take the file (e.g. "Present" and "Fill in" for a PDF). Default:
+   * the component's `title`
+   */
+  action?: string;
+}
+/** A file as far as matching goes: name, MIME type and size */
+interface StageFileInfo {
+  name: string;
+  type?: string;
+  size?: number;
+}
+/**
+ * Showing files on the stage (`state.stageFiles`), provided by the `stage`
+ * plugin while in a room. Document components take the file they were
+ * opened for with `take(docId)`; other plugins (e.g. the chat) offer
+ * "Show on stage" for files `typesFor` knows.
+ */
+interface StageFilesApi {
+  /** Names of the document types that show this file; empty if none, or if the participant may not open documents */
+  typesFor: (file: StageFileInfo) => string[];
+  /**
+   * Opens a new document for the file, of the only matching type or of the
+   * one the participant chooses. Resolves the document id, `undefined` if
+   * nothing was opened (no match, canceled, document limit, no permission)
+   */
+  open: (file: File) => Promise<string | undefined>;
+  /**
+   * For the component of a document opened by `open`: the file to show,
+   * once - the next call returns `undefined`. Share it as if the
+   * participant had picked it in the document.
+   */
+  take: (docId?: string) => File | undefined;
+}
+declare global {
+  interface AppState {
+    /** Showing files on the stage, set by the `stage` plugin while in a room */
+    stageFiles?: StageFilesApi;
+  }
+}
 /**
  * A plain object shared by all participants of the room. Change
  * `value` like any reactive Vue object; changes travel to everyone and merge
@@ -1065,6 +1435,14 @@ declare global {
       mode: RoomMode;
     };
     /**
+     * The password typed into that prompt, kept while the room entered with
+     * it stays empty. A wrong password leads into an empty room of its own,
+     * indistinguishable from being the first (by design: nobody can probe
+     * whether a room exists), so the empty stage asks to check it. Cleared
+     * as soon as anyone else shows up - then the password is proven right.
+     */
+    roomPasswordEntered?: string;
+    /**
      * What to share on entering the room, instead of the choice remembered
      * from the lobby. Set when a call resumes after an update reload, so
      * camera and microphone come back exactly as they were.
@@ -1074,7 +1452,7 @@ declare global {
     visitors: Record<string, RoomVisitorState>;
     /** Shared state of the room, see `SyncApi`. Set while in a room (plugin `sync`) */
     sync?: SyncApi;
-    /** Media handling via `media` or `media-pro` */
+    /** Media handling via the `media` plugin */
     media: MediaState;
     /**
      * Every local stream announced via `appSetMediaStream`, by name (see
@@ -1113,11 +1491,38 @@ interface AppComponentBasic {
   /** Icon component, used where the placement shows one (e.g. the admin navigation) */
   icon?: Component;
   /**
+   * Set by the host, not by the plugin: the component comes from an external
+   * plugin (loaded from `/plugins/<id>/`). Hosts use it to fence in markup
+   * they do not control, e.g. `stage` shows only a placeholder for a
+   * minimized external document.
+   */
+  readonly external?: boolean;
+  /**
    * Only show the component in rooms of these modes, e.g. `['video']` for
    * camera or stage settings that mean nothing in a chat room. Outside a
    * room (`state.roomMode` unset) it is always shown. Default: all modes.
    */
   roomModes?: RoomMode[];
+  /**
+   * Only show the component while this returns `true`; reactive, read
+   * where the components are listed. E.g. a sidebar tab that exists only
+   * while something runs. Default: always.
+   */
+  visible?: () => boolean;
+  /**
+   * Only for `presentation`: participant thumbnails never cover this
+   * document while it is shown large - the stage lays it out beside them,
+   * as with the "side by side" setting. For documents with controls at
+   * their edges, e.g. a video player.
+   */
+  keepClear?: boolean;
+  /**
+   * Only for `presentation`: files this document type shows. Dropped on
+   * the room window, picked with "Open file" in the stage menu or sent from
+   * the chat, such a file opens a new document of this type; the component
+   * takes it with `state.stageFiles.take(docId)`.
+   */
+  files?: AppDocumentFiles;
 }
 /** A sidebar tab: needs a `name` and an icon as SVG source */
 interface AppComponentSidebar extends AppComponentBasic {
@@ -1126,13 +1531,19 @@ interface AppComponentSidebar extends AppComponentBasic {
   name: string;
   /** Icon as SVG code */
   iconSvg: string;
+  /**
+   * The page fills the sidebar height and scrolls its parts itself (e.g. a
+   * list above fixed actions). By default the sidebar scrolls the page
+   * together with its title, and the page must not scroll itself.
+   */
+  fixedLayout?: boolean;
 }
 interface AppComponentSimple extends AppComponentBasic {
   placement:
-  /** Global additions outside the routing, like for overlays (beta, pro, etc) */
+  /** Global additions outside the routing, like for overlays (beta etc.) */
   'app-addition' |
   /**
-   * A document type on stage-pro (whiteboard, editor, ...). Any number of
+   * A document type on the stage (whiteboard, editor, ...). Any number of
    * documents can be open at once, each in its own tile. The component gets
    * the prop `docId` and keeps its shared state under `documentSyncId(name,
    * docId)` (e.g. `sync.getYDoc(...)`), so two documents of the same type do
@@ -1143,8 +1554,50 @@ interface AppComponentSimple extends AppComponentBasic {
   'settings' |
   /** Stuff that is above stage, like hint for sharing */
   'stage-overlay' |
+  /**
+   * The room's status area: small pills stacked at the top right of the
+   * room, above stage and chat (video and chat rooms, mobile too), e.g. a
+   * running timer or the raised hands. For state everybody should notice
+   * at a glance, so the toolbar keeps only actions. Gets no props; render
+   * nothing while there is nothing to show. The area itself lets pointer
+   * events through, the pills take them: use class `room-status-pill` (on a
+   * `button` or a `div`) for the standard look. Keep a pill one line high;
+   * details belong in a popover or dialog opened from it. Sorted by
+   * `sortWeight`, top to bottom. Notices (`ctx.notify`) stack right below
+   * the pills.
+   */
+  'room-status' |
   /** Replace the whole default stage. Must only be one! */
   'stage-container' |
+  /**
+   * A layer over every video tile (camera or screen, local and remote),
+   * e.g. a highlight ring or floating emoji. It covers the whole tile
+   * (`inset: 0`) above the video and the avatar, below the name label and
+   * the tile buttons, and has `pointer-events: none` (set `auto` on own
+   * elements to make them clickable). Gets `StageTileProps`; render nothing
+   * for tiles the component does not care about.
+   */
+  'stage-tile' |
+  /**
+   * Small inline badges in a video tile's name label, after the name and
+   * the mute icon, e.g. a raised hand. Keep them icon-sized (about 14px).
+   * Gets `StageTileProps`. While a badge is shown the label stays visible
+   * on thumbnails too, where it is otherwise only shown on hover.
+   */
+  'stage-tile-badge' |
+  /**
+   * One row of the people list (sidebar `users`), after the name and the
+   * microphone/camera state, e.g. a role badge or a menu of actions for
+   * this person. Gets `UsersItemProps`. Keep it compact (icon-sized
+   * badges, icon buttons): the sidebar is narrow, on a phone a sheet.
+   */
+  'users-item' |
+  /**
+   * The people list (sidebar `users`), between the title and the list:
+   * notes and actions for everybody in the room, e.g. "ask everyone to
+   * mute". Render nothing when there is nothing to say.
+   */
+  'users-header' |
   /**
    * The chat column between stage and sidebar (`state.panes.chat`); in a
    * chat room without open documents it is the main area, on narrow
@@ -1163,13 +1616,26 @@ interface AppComponentSimple extends AppComponentBasic {
   'toolbar-sidebar-container' | 'toolbar-sidebar' |
   /** Buttons or similar for the toolbar */
   'toolbar-left' | 'toolbar-middle-left' | 'toolbar-middle-right' | 'toolbar-right' |
+  /**
+   * Start page, the group of secondary ways in below the big start button
+   * ("Start as chat", ...), drawn as pills. Use class `start-secondary-link`.
+   * Used by "pwa" and "direct".
+   */
+  'welcome-secondary' |
+  /**
+   * Start page, options for the new room right below the big start button,
+   * holding for it and "Start as chat" alike (e.g. "Moderated", plugin
+   * `moderation`). To change the room both links open, inject
+   * `startRoomSecretKey` (`@/lib/start-room-name`) and replace its password.
+   */
+  'welcome-options' |
   /** Start page between room name input and footer. Used by "history" plugin. */
   'welcome-middle' |
   /** The top level */
   'room' |
   /**
    * Before entering an audio or video room (`state.lobby` is set): prepare
-   * the participant, e.g. camera preview and on/off switches (`media-pro`).
+   * the participant, e.g. camera preview and on/off switches (`media`).
    * Without any component here the room is entered right away.
    */
   'lobby' |
@@ -1202,11 +1668,91 @@ interface AppMenuItem {
  * renders, so it may depend on reactive state.
  */
 interface AppMenuSection {
-  /** `stage` - the share menu of the stage (stage-pro): screens, documents, fullscreen */
-  placement: 'stage';
-  items: () => AppMenuItem[];
+  /**
+   * - `stage` - the share menu of the stage (`stage` plugin): screens, documents, fullscreen
+   * - `camera` - the camera menu (`media` plugin): toolbar button and lobby, below the cameras
+   * - `stage-tile` - the menu of one camera or screen tile (`stage` plugin),
+   *   local or remote; `items` gets the tile and returns nothing for tiles
+   *   it does not care about. Read when the menu opens.
+   */
+  placement: 'stage' | 'camera' | 'stage-tile';
+  /** `tile` is only set for `stage-tile` */
+  items: (tile?: StageTileProps) => AppMenuItem[];
   sortWeight?: number;
   roomModes?: RoomMode[];
+}
+/** The tile a `stage-tile` or `stage-tile-badge` component decorates */
+interface StageTileItem {
+  /** Id of the tile, stable while the stream is shown */
+  id: string;
+  /** What the tile shows; the tile placements see only `camera` and `screen` */
+  kind: 'camera' | 'screen' | 'document' | 'share' | 'placeholder';
+  /** The own camera or screen */
+  isLocal: boolean;
+  /** The tile stands for a participant (not a document) */
+  isVisitor: boolean;
+  /** The remote participant, unset for local tiles */
+  visitor?: RoomVisitor;
+  /** Name the stream is sent under, see `stream-names` */
+  streamName?: string;
+}
+/** Props of `stage-tile` and `stage-tile-badge` components */
+interface StageTileProps {
+  item: StageTileItem;
+  /**
+   * The participant the tile belongs to: the remote peer id, or the own
+   * `state.room.peerLocalId` on local tiles. Unset while not known yet
+   */
+  peerId?: string;
+  /** Same as `item.isLocal` */
+  isLocal: boolean;
+  /** Same as `item.streamName`, e.g. `video` for the main camera (`isMainCameraStream`) */
+  streamName?: string;
+}
+/** Props of `users-item` components: one person of the people list */
+interface UsersItemProps {
+  /**
+   * The connections of this person: one peer id per tab or device (a user
+   * with several tabs shows once). For the own row `state.room.peerLocalId`;
+   * empty while not known yet
+   */
+  peerIds: string[];
+  /** The own row */
+  self: boolean;
+  /** Display name as the list shows it, unset while unnamed or connecting */
+  name?: string;
+}
+/**
+ * A short notice (toast), see `AppPluginContext.notify`. Notices show
+ * below the room's status pills (`room-status`), so the two never cover
+ * each other; outside a room at the top right, on a phone at the bottom.
+ * Something that stays as long as a state lasts (a running timer, a
+ * recording) belongs in a `room-status` pill instead.
+ */
+interface AppNotice {
+  /**
+   * Notifying again with the same id replaces the shown notice. Unique
+   * within the plugin (the app prefixes it with the plugin's name)
+   */
+  id?: string;
+  /** Color and icon; screen readers read `warn` and `error` at once. Default `info` */
+  mode?: 'info' | 'success' | 'warn' | 'error';
+  /** Translated text, e.g. `ctx.i18n.t(...)` */
+  title: string;
+  message?: string;
+  /**
+   * Milliseconds until it closes by itself, `-1` stays until closed. The
+   * time pauses while the pointer or the focus is on the notices. Default
+   * by mode: success 4 s, info 5 s, warn 8 s, error stays
+   */
+  timeout?: number;
+  /** Without `onCancel` a click on the notice runs it; with, two buttons show */
+  onAction?: () => void;
+  actionLabel?: string;
+  onCancel?: () => void;
+  cancelLabel?: string;
+  /** The notice is gone, for whatever reason */
+  onClose?: () => void;
 }
 /** Where a component is shown, see the comments on each value of `AppComponent['placement']` */
 type AppComponentPlacement = AppComponent['placement'];
@@ -1228,11 +1774,20 @@ interface AppGlobalContext extends AppBaseContext {
   components: AppComponent[];
   /** All registered menu sections, read them with `menuSectionItems()` */
   menus: AppMenuSection[];
+  /** All registered keyboard shortcuts (reactive), see `AppPluginContext.addShortcuts` */
+  shortcuts: AppShortcutEntry[];
   i18n: {
     /** Translate an i18n key (`$t` in templates) */
     t: (s: string) => string;
     /** @internal Host hook behind `AppPluginContext.addLocaleMessages` */
     addMessages?: (pluginId: string, locales: PluginLocales) => Promise<void>;
+  };
+  /** @internal Host hook behind `AppPluginContext.notify`; ids come prefixed */
+  notices?: {
+    show: (notice: AppNotice & {
+      id: string;
+    }) => void;
+    close: (id: string) => void;
   };
 }
 /** What a plugin's `setup(ctx)` receives */
@@ -1256,6 +1811,35 @@ interface AppPluginContext extends AppPluginBaseContext, AppGlobalContext {
    * ```
    */
   addLocaleMessages: (locales: PluginLocales) => Promise<void>;
+  /**
+   * Add keyboard shortcuts. They work while the plugin `shortcuts` is on
+   * (default), are listed in its overview (`?`) and removed with the plugin
+   * or by calling the returned function. Text fields, open dialogs and IME
+   * composition are guarded centrally; the key's default (scrolling, a
+   * button press) is prevented only when a shortcut runs.
+   *
+   * @example
+   * ```ts
+   * ctx.addShortcuts([
+   *   { id: 'media.mic', title: 'media.shortcutMic', keys: ['M', 'Mod+Shift+M'], action: () => doToggleMic(), when: () => !!ctx.state.room },
+   *   { id: 'pointer.laser', title: 'pointer.shortcutLaser', keys: 'L', hold: { down: () => laser.value = true, up: () => laser.value = false } },
+   * ])
+   * ```
+   */
+  addShortcuts: (shortcuts: AppShortcut | AppShortcut[]) => () => void;
+  /**
+   * Show a short notice (toast) below the room's status pills: something
+   * happened ("Time is up", "Anna left"), or needs a decision ("Camera
+   * blocked - Try again"). Returns a function that closes it; notices of
+   * the plugin also close with it.
+   *
+   * @example
+   * ```ts
+   * const close = ctx.notify({ id: 'end', title: ctx.i18n.t(`${pluginName}.end`), timeout: 10000 })
+   * ctx.notify({ id: 'failed', mode: 'warn', title, message, timeout: -1, actionLabel: t('retry'), onAction: doRetry, onCancel: () => {} })
+   * ```
+   */
+  notify: (notice: AppNotice) => () => void;
 }
 /**
  * Base class of a Briefing client plugin; a plugin module exports its class
@@ -1277,13 +1861,293 @@ declare const manifestSchema: Type<Omit<{
 }, "$schema"> & {
   $schema?: string | undefined;
 }>;
+/**
+ * The laser pointer (plugin `pointer`). Set while the plugin is active.
+ * Plugins that show something to point at place a `PointerLayer` over it.
+ */
+interface PointerApi {
+  /** Laser pointer switched on by this participant (stage menu, or `L` held) */
+  active: boolean;
+  /**
+   * The laser points or draws right now (`active`, or `L` or Space held) and
+   * this participant may point. A surface with own drag gestures (a map)
+   * leaves the pointer to the laser while this is `true`.
+   */
+  readonly pointing?: boolean;
+  /** @internal Implementation behind `PointerLayer` */
+  component: Component;
+}
+declare global {
+  interface AppState {
+    /** Laser pointer, set while the plugin `pointer` is active */
+    pointer?: PointerApi;
+  }
+}
+/** Where a speech-to-text engine stands, see `TranscriberApi.status` */
+type TranscriberStatus = 'idle' | 'loading' | 'ready' | 'error';
+/** What `TranscriberApi.transcribe` heard */
+interface TranscriberResult {
+  /** `''` when nothing intelligible was said */
+  text: string;
+  /** The language transcribed as (ISO 639-1): the one asked for, or the one detected */
+  language?: string;
+}
+/** A speech model the participant may pick, see `TranscriberApi.models` */
+interface TranscriberModel {
+  id: string;
+  /** Name and where it runs, e.g. "Parakeet TDT v3 (CPU)" */
+  label: string;
+  /** Download in MB, loaded once per browser */
+  sizeMb?: number;
+}
+/**
+ * Speech to text in the participant's own browser (`state.transcriber`),
+ * provided by an engine plugin (e.g. `com.apperdeck.plugin.transcript`) and
+ * used by plugins that write down what is said (`record`: "Write
+ * transcript"). The audio never leaves the browser: the engine and its model
+ * load from the instance itself.
+ */
+interface TranscriberApi {
+  /** Reactive. `loading` while the model is fetched and compiled */
+  readonly status: TranscriberStatus;
+  /** Reactive, `0..1` while `loading` (`undefined` when unknown) */
+  readonly progress?: number;
+  /** Reactive, segments waiting to be transcribed */
+  readonly pending: number;
+  /** Reactive, what runs once loading started, e.g. "Whisper small (CPU)" */
+  readonly label?: string;
+  /**
+   * Fetch and compile the model ahead of the first `transcribe` (which
+   * does it as well). Rejects when the engine cannot run here.
+   */
+  prepare: () => Promise<void>;
+  /**
+   * Text of one utterance: mono PCM at `TRANSCRIBER_SAMPLE_RATE`, at most
+   * `TRANSCRIBER_MAX_SECONDS` long, in `language` (ISO 639-1) or, without
+   * one, in the language the engine detects (which costs extra time).
+   * Calls are queued and answered in order.
+   */
+  transcribe: (pcm: Float32Array, opt?: {
+    language?: string;
+  }) => Promise<TranscriberResult>;
+  /**
+   * Reactive, the models this browser can run, for a picker. Absent when
+   * the engine offers no choice.
+   */
+  readonly models?: readonly TranscriberModel[];
+  /** Reactive, the id picked with `setModel`; `undefined` = the engine decides */
+  readonly model?: string;
+  /**
+   * Pick the model (`undefined`: the engine decides again), remembered in
+   * this browser. Applies from the next `transcribe` once the queue is
+   * empty; the new model loads then.
+   */
+  setModel?: (id?: string) => void;
+}
+/** Sample rate of the PCM passed to `TranscriberApi.transcribe` */
+declare const TRANSCRIBER_SAMPLE_RATE = 16000;
+/** Longest utterance `transcribe` takes (the window of Whisper-like models) */
+declare const TRANSCRIBER_MAX_SECONDS = 28;
+declare global {
+  interface AppState {
+    /** Speech to text in the browser, set while an engine plugin is active */
+    transcriber?: TranscriberApi;
+  }
+}
 /** Get the app context from within a Vue component. Shortcut to the equivalent `inject` call, but with safety net. */
 declare function getAppContext(): AppGlobalContext | never;
 /**
  * Entries of all sections for a menu, separated by an empty entry; reactive
  * when used inside a `computed`.
  */
-declare function menuSectionItems(app: AppGlobalContext, placement: AppMenuSection['placement']): AppMenuItem[];
+declare function menuSectionItems(app: AppGlobalContext, placement: AppMenuSection['placement'], tile?: StageTileProps): AppMenuItem[];
 /** Vue computed list of components for a certain placement */
 declare function computedComponents(placement: AppComponentPlacement, orderby?: string[]): import("vue").ComputedRef<AppComponent[]>;
-export { Room as A, UseDisposeWithUtils as B, PluginLocales as C, MediaState as D, MediaStartOptions as E, RoomVisitor as F, LogLevelAliasType as H, RoomVisitorEvents as I, SendParameters as L, RoomMode as M, RoomState as N, AppEmitter as O, PeerStream as P, z_collection_d_exports as R, LocaleSource as S, MediaManagerDeviceInfo as T, LoggerInterface as U, DisposerFunction as V, AppPluginBase as _, AppComponent as a, pluginTypeMeta as b, AppGlobalContext as c, AppPlugin as d, AppPluginContext as f, SyncedObject as g, SyncApi as h, manifestSchema as i, RoomEvents as j, VideoView as k, AppMenuItem as l, RoomVisitorState as m, menuSectionItems as n, AppComponentPlacement as o, RoomPanes as p, getAppContext as r, AppComponentSidebar as s, computedComponents as t, AppMenuSection as u, AppPluginContextApi as v, MediaManager as w, LocaleMessages as x, BriefingTypeMetaExtensions as y, Type as z };
+/** What `useStorage` of vueuse and plain code need */
+interface DeviceStorageLike {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+  removeItem: (key: string) => void;
+}
+/**
+ * Storage for settings of this device - use it instead of `localStorage`.
+ * With vueuse: `useStorage(key, initial, deviceStorage)` instead of
+ * `useLocalStorage(key, initial)`.
+ */
+declare const deviceStorage: DeviceStorageLike;
+/** Whether this device remembers settings beyond the tab (reactive) */
+declare const deviceRemembered: Readonly<Ref<boolean>>;
+interface FileTransportOptions {
+  /** How long a request may take before it fails, ms. Default 30 s */
+  requestTimeout?: number;
+  /** How long to wait for the channel to the sharing peer, ms. Default 15 s */
+  connectTimeout?: number;
+}
+/**
+ * Shares files of this tab with the other participants and fetches byte
+ * ranges of the files they share, over an encrypted `PeerDataChannel`.
+ * Nothing is uploaded: a file stays in the tab that offered it, the others
+ * ask for the ranges they need. Put `{ id, owner }` (and whatever else the
+ * viewers need, like name and size) into the shared state yourself.
+ *
+ * @example
+ * ```ts
+ * ctx.on('appWillEnterRoom', ({ room, dispose }) => {
+ *   const transport = setupFileTransport(ctx.state.openDataChannel!(room, { name: pluginName }))
+ *   dispose.add(transport.dispose)
+ * })
+ * // Sharing: const id = transport.offer(file)
+ * // Viewing: const bytes = await transport.fetchRange(owner, id, 0, 1024)
+ * ```
+ */
+declare function setupFileTransport(channel: PeerDataChannel, opt?: FileTransportOptions): {
+  offer: (file: Blob) => string;
+  withdraw: (id: string) => void;
+  /** The file behind id `id`, if it is shared from this tab */
+  offeredFile: (id: string) => Blob | undefined;
+  fetchRange: (peerId: string, id: string, start: number, end: number) => Promise<Uint8Array>;
+  dispose: ((strictSync?: boolean) => Promise<any> | void) & {
+    readonly disposed: number;
+    add: (obj?: DisposerFunction | {
+      dispose: DisposerFunction;
+    }) => DisposerFunction | undefined;
+    remove: (disposable: DisposerFunction | {
+      dispose: DisposerFunction;
+    }) => Promise<void> | void;
+    dispose: (strictSync?: boolean) => Promise<any> | void;
+    disposeSync: () => void;
+    sync: () => void;
+    getSize(): number;
+    isDisposed(): boolean;
+    [Symbol.dispose](): void | Promise<any>;
+    [Symbol.asyncDispose](): Promise<any>;
+  } & {
+    timeout: (fn: TimerExecFunction, timeout?: number) => DisposerFunction;
+    interval: (fn: TimerExecFunction, interval?: number) => DisposerFunction;
+    intervalPause: (fn: TimerExecFunction, interval?: number) => DisposerFunction;
+    on: (emitter: any, eventName: string, fn: (ev?: any) => void, ...args: any[]) => DisposerFunction;
+    once: (emitter: any, eventName: string, fn: (ev?: any) => void, ...args: any[]) => DisposerFunction;
+  };
+};
+type FileTransport = ReturnType<typeof setupFileTransport>;
+/** Size in pixels */
+interface PointerSize {
+  width: number;
+  height: number;
+}
+/** Area in pixels, relative to the surface's top left corner */
+interface PointerBox extends PointerSize {
+  left: number;
+  top: number;
+}
+/** How the content is fitted into its surface, as CSS `object-fit` */
+type PointerFit = 'contain' | 'cover' | 'fill';
+/**
+ * Laser pointer over a surface: place it as the last child of an element
+ * with `position: relative` that shows the content (a video, a page). While
+ * a participant has the laser pointer on, moving over that element shows a
+ * dot to everybody, at the same spot of the content whatever their layout.
+ *
+ * Renders nothing without the plugin `pointer`.
+ *
+ * @example
+ * ```vue
+ * <div class="my-surface" style="position: relative">
+ *   <video ref="video" style="object-fit: contain" ... />
+ *   <PointerLayer :target="`my-plugin:${docId}`" :media="video" />
+ * </div>
+ * ```
+ *
+ * Content the plugin places itself (a map, a zoomable canvas) passes
+ * `contentBox`: where the content is drawn right now, in surface pixels.
+ * Content coordinates are then 0..1 across that box, the same spot for
+ * everybody even when each participant pans and zooms on their own.
+ */
+declare const PointerLayer: import("vue").DefineComponent<import("vue").ExtractPropTypes<{
+  /**
+   * What is pointed at, the same for every participant (e.g. the document
+   * id, plus the page number for paged content). Pointers show only on
+   * layers with the same target.
+   */
+  target: {
+    type: StringConstructor;
+    required: true;
+  };
+  /** Element that draws the content; its intrinsic size and `object-fit` place the content in the surface */
+  media: {
+    type: PropType<HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null>;
+    default: undefined;
+  };
+  /** Intrinsic size of the content, if there is no `media` element */
+  contentSize: {
+    type: PropType<PointerSize>;
+    default: undefined;
+  };
+  /** How the content is fitted, default: the `object-fit` of `media`, else `fill` */
+  fit: {
+    type: PropType<PointerFit>;
+    default: undefined;
+  };
+  /**
+   * Where the content is drawn, in pixels relative to the surface; wins
+   * over `media`, `contentSize` and `fit`. May be far larger than the
+   * surface (a map of the world, zoomed in).
+   */
+  contentBox: {
+    type: PropType<PointerBox>;
+    default: undefined;
+  };
+  /** Content is shown mirrored (e.g. the own camera) */
+  mirrored: {
+    type: BooleanConstructor;
+    default: boolean;
+  };
+}>, () => import("vue").VNode<import("vue").RendererNode, import("vue").RendererElement, {
+  [key: string]: any;
+}> | null, {}, {}, {}, import("vue").ComponentOptionsMixin, import("vue").ComponentOptionsMixin, {}, string, import("vue").PublicProps, Readonly<import("vue").ExtractPropTypes<{
+  /**
+   * What is pointed at, the same for every participant (e.g. the document
+   * id, plus the page number for paged content). Pointers show only on
+   * layers with the same target.
+   */
+  target: {
+    type: StringConstructor;
+    required: true;
+  };
+  /** Element that draws the content; its intrinsic size and `object-fit` place the content in the surface */
+  media: {
+    type: PropType<HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null>;
+    default: undefined;
+  };
+  /** Intrinsic size of the content, if there is no `media` element */
+  contentSize: {
+    type: PropType<PointerSize>;
+    default: undefined;
+  };
+  /** How the content is fitted, default: the `object-fit` of `media`, else `fill` */
+  fit: {
+    type: PropType<PointerFit>;
+    default: undefined;
+  };
+  /**
+   * Where the content is drawn, in pixels relative to the surface; wins
+   * over `media`, `contentSize` and `fit`. May be far larger than the
+   * surface (a map of the world, zoomed in).
+   */
+  contentBox: {
+    type: PropType<PointerBox>;
+    default: undefined;
+  };
+  /** Content is shown mirrored (e.g. the own camera) */
+  mirrored: {
+    type: BooleanConstructor;
+    default: boolean;
+  };
+}>> & Readonly<{}>, {
+  media: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null;
+  contentSize: PointerSize;
+  fit: PointerFit;
+  contentBox: PointerBox;
+  mirrored: boolean;
+}, {}, {}, {}, string, import("vue").ComponentProvideOptions, true, {}, any>;
+export { MediaManagerDeviceInfo as $, StageTileItem as A, AppShortcut as B, AppComponentSidebar as C, LogLevelAliasType as Ct, AppNotice as D, AppMenuSection as E, SyncApi as F, BriefingTypeMetaExtensions as G, AppShortcutHold as H, SyncedObject as I, LocaleSource as J, pluginTypeMeta as K, AppDocumentFiles as L, UsersItemProps as M, RoomPanes as N, AppPlugin as O, RoomVisitorState as P, MediaManager as Q, StageFileInfo as R, AppComponentPlacement as S, DisposerFunction as St, AppMenuItem as T, AppPluginBase as U, AppShortcutEntry as V, AppPluginContextApi as W, ModerationApi as X, PluginLocales as Y, ModerationRole as Z, TranscriberResult as _, SendParameters as _t, FileTransportOptions as a, VideoView as at, manifestSchema as b, Type as bt, deviceRemembered as c, PeerDataChannelEvents as ct, menuSectionItems as d, RoomMode as dt, MediaStartOptions as et, getAppContext as f, RoomState as ft, TranscriberModel as g, RoomVisitorEvents as gt, TranscriberApi as h, RoomVisitor as ht, FileTransport as i, AppEmitter as it, StageTileProps as j, AppPluginContext as k, deviceStorage as l, Room as lt, TRANSCRIBER_SAMPLE_RATE as m, PeerStream as mt, PointerFit as n, ProcessedVideoTrack as nt, setupFileTransport as o, OpenPeerDataChannel as ot, TRANSCRIBER_MAX_SECONDS as p, ConnectionRoute as pt, LocaleMessages as q, PointerSize as r, VideoProcessor as rt, DeviceStorageLike as s, PeerDataChannel as st, PointerLayer as t, MediaState as tt, computedComponents as u, RoomEvents as ut, TranscriberStatus as v, TrackStats as vt, AppGlobalContext as w, LoggerInterface as wt, AppComponent as x, UseDisposeWithUtils as xt, PointerApi as y, z_collection_d_exports as yt, StageFilesApi as z };

@@ -1,4 +1,4 @@
-import { C as PluginLocales, O as AppEmitter, a as AppComponent, d as AppPlugin, f as AppPluginContext, u as AppMenuSection } from "./plugin-DsgI22NV.js";
+import { D as AppNotice, E as AppMenuSection, O as AppPlugin, V as AppShortcutEntry, Y as PluginLocales, it as AppEmitter, k as AppPluginContext, x as AppComponent } from "./plugin-DRcmxiyo.js";
 export interface SetupTestPluginOptions {
   /** Raw config of the plugin, as an operator would set it; parsed with the plugin's `configSchema` */
   config?: Record<string, any>;
@@ -20,8 +20,14 @@ export interface TestPlugin {
   components: AppComponent[];
   /** Menu sections added with `ctx.addMenuSection()` */
   menus: AppMenuSection[];
+  /** Keyboard shortcuts added with `ctx.addShortcuts()`; call `action()` or `hold.down()` to try them */
+  shortcuts: AppShortcutEntry[];
   /** Translations added with `ctx.addLocaleMessages()` */
   locales: PluginLocales[];
+  /** Notices shown with `ctx.notify()` and not closed yet, ids prefixed with the plugin's name */
+  notices: (AppNotice & {
+    id: string;
+  })[];
   /** The event bus, e.g. `await emitter.emit('appDidEnterRoom', ...)` */
   emitter: AppEmitter;
   /** The plugin's parsed config (`ctx.config[plugin.name]`) */

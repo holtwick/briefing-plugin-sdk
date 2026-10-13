@@ -56,6 +56,37 @@ export default class implements AppPlugin {
 }
 ```
 
+A `presentation` component of an external plugin runs in its own stacking
+context, so its z-indices never cover the stage's tile buttons. While its tile
+is minimized, the stage shows a placeholder with the title instead of
+mounting the component - keep the document's state in the shared doc, not in
+the component.
+
+A document type that shows files lists them in `files` (extensions, MIME
+types, `maxSize`, optional `action` label): a file dropped on the room
+window, picked with "Open file..." in the stage menu or sent from the chat
+then opens a new document of it. The component gets that file once from
+`app.state.stageFiles?.take(props.docId)` and shares it as if the
+participant had picked it in the document. Received files often carry no
+useful MIME type - list the extensions too.
+
+Settings of this device - the last tool, a color, a picked option - go
+through `deviceStorage` instead of `localStorage` (with vueuse:
+`useStorage(key, initial, deviceStorage)`). It follows the participant's
+"Remember on this device": on a borrowed computer they live only in the tab
+and are gone when it closes; `localStorage` written directly is emptied
+there anyway.
+
+In a moderated room only moderators and presenters change stage documents;
+for everybody else a document is read-only. Ask
+`app.state.moderation?.canEdit ?? true` (missing on hosts without the
+`moderation` plugin or older ones: allowed) and switch editing off while it
+is `false` - e.g. `editor.setEditable(canEdit)`, `disabled`, no edit buttons.
+The shared doc itself does not know who wrote a change, so this is the
+honest-client rule; `state.moderation.mayEdit(peerId)` checks a peer id your
+plugin wrote next to a value (e.g. who changed a shared setting) on the
+receiving side.
+
 ## Build
 
 ```ts
@@ -76,6 +107,28 @@ stays a normal dev server for working on the plugin standalone.
 Options: `entry` (default `src/index-client.ts`), `external` (more modules the
 app provides).
 
+## Debug
+
+`vite` alone runs the plugin standalone, with your sources in the browser's
+developer tools. To see it inside Briefing, build into a local instance and
+reload after each change:
+
+```sh
+npm run build -- --watch --sourcemap
+docker run -p 8080:8080 \
+  -v "$PWD/dist:/app/data/plugins/com.example.countdown" \
+  -e APP__THIRD_PARTY_PLUGINS=true -e APP__PLUGINS_ON=com.example.countdown \
+  -e AUTH=dev holtwick/briefing-pro
+```
+
+- `--sourcemap` writes `.map` files next to `plugin.js`: breakpoints and
+  stack traces show your sources. Leave it out for the release build, unless
+  you want to publish your sources with it.
+- `Logger` output stays silent by default: `localStorage.zeed = '*'` in the
+  browser console, then reload (`'com.example.*'` for your loggers only).
+- The admin area (`/config`, token from `AUTH`) shows why a plugin does not
+  load (manifest, version, module).
+
 ## Test
 
 ```ts
@@ -94,7 +147,8 @@ it('adds a stage document', async () => {
 ```
 
 `setupTestPlugin` runs `setup()` the way the app does (real context class,
-config parsing, fresh event bus) and records components, menu sections and
+config parsing, fresh event bus) and records components, menu sections,
+keyboard shortcuts (`shortcuts`, call their `action()` to try them) and
 translations. Errors of `setup()` fail the test. Further options: `state`
 (app state overrides), `activePlugins` (for `ctx.hasPlugin`). For components:
 `mount(Component, provideAppContext(ctx))` with `@vue/test-utils`.

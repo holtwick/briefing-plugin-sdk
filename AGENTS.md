@@ -28,6 +28,22 @@ them before guessing.
    channels: `ctx.state.sync` (`getMO` for plain objects, `getYDoc` for Yjs),
    or `RoomVisitor.getRpc`/`getDataChannel`. Never send room content to a
    server.
+7. Keyboard: never add your own `keydown` listener on `window`/`document`.
+   Register keys with `ctx.addShortcuts({ id: '<plugin id>.<name>', title,
+keys, action | hold, when })`; the app guards text fields and dialogs,
+   lists them in its `?` overview and lets operators turn single keys off.
+   Use `when` for "only while my document is shown" and a `priority` above 0
+   for keys that should win over the app's meaning of the same key then.
+8. Notices: show events ("Time is up", "Upload failed") with
+   `ctx.notify({ id, mode, title, message, timeout })`, never a toast or
+   floating box of your own; the app stacks them below the room's status
+   pills. Something that lasts as long as a state (running, recording) is a
+   `room-status` component with class `room-status-pill` instead.
+9. Settings of this device (last tool, colors, a picked option) go through
+   `deviceStorage` from `briefing-plugin-sdk`, never `localStorage`
+   directly: it follows the participant's "Remember on this device" and
+   keeps nothing beyond the tab on a borrowed computer. With vueuse:
+   `useStorage(key, initial, deviceStorage)`.
 
 ## Skeleton
 
@@ -79,6 +95,21 @@ const state = app.state.sync!.getMO(documentSyncId(pluginName, props.docId), { c
 state.count++ // every participant sees it
 ```
 
+A stage document that shows files declares them, so a file dropped on the
+room window opens it (`files: { extensions: ['gpx'], types: ['application/gpx+xml'], maxSize }`
+on `addComponent`). The component takes that file once and shares it like
+one picked in the document:
+
+```ts
+const handed = app.state.stageFiles?.take(props.docId)
+if (handed)
+  doShareFile(handed)
+```
+
+In a moderated room a stage document is read-only for participants and
+viewers: disable editing while `app.state.moderation?.canEdit ?? true` is
+`false` (missing means allowed).
+
 Extension points (augment in `_types.ts` with `declare global`): `AppConfig`
 (your config), `AppState` (shared app state), `AppEmitterFunctions` (events,
 prefix names with something unique).
@@ -99,7 +130,7 @@ npm run check   # vue-tsc + vitest + vite build
 ## Run it in Briefing
 
 ```sh
-npm run build -- --watch
+npm run build -- --watch --sourcemap
 docker run -p 8080:8080 \
   -v "$PWD/dist:/app/data/plugins/com.example.countdown" \
   -e APP__THIRD_PARTY_PLUGINS=true -e APP__PLUGINS_ON=com.example.countdown \
@@ -108,6 +139,9 @@ docker run -p 8080:8080 \
 
 Open http://localhost:8080, reload after each rebuild. The admin area
 (`/config`, token from `AUTH`) shows why a plugin does not load.
+`--sourcemap` lets the browser's developer tools show your sources
+(breakpoints, readable stack traces); `localStorage.zeed = '*'` in the
+browser console, then reload, prints the `Logger` output.
 Note: `data/plugins/` and `APP__THIRD_PARTY_PLUGINS` need a Briefing release
 from October 2026 or later.
 
